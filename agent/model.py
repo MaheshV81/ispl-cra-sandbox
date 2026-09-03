@@ -176,7 +176,8 @@ def invoke(model_id: str, restricted: bool, user_msg: str) -> tuple[dict, list[s
     return payload, calls, usage
 
 
-def build_user_message(pr: dict, files, sensitive_hits: list[str], redact) -> str:
+def build_user_message(pr: dict, files, sensitive_hits: list[str], redact,
+                       context_block: str = "", standard_block: str = "") -> str:
     from .diff import annotate
 
     blocks = []
@@ -190,8 +191,16 @@ def build_user_message(pr: dict, files, sensitive_hits: list[str], redact) -> st
     title = redact(pr.get("title") or "")
     body = redact((pr.get("body") or "(none)")[:2000])
 
-    return (
+    message = (
         f"Pull request: {title}\n"
         f"Description:\n{body}\n\n"
         f"--- DIFF ({len(files)} files) ---\n\n" + redact("\n\n".join(blocks))
     )
+    # Context and standards are appended AFTER the diff so the diff stays the
+    # most salient thing in the prompt. Findings must cite diff lines; putting
+    # context first invites the model to review the context instead.
+    if context_block:
+        message += redact(context_block)
+    if standard_block:
+        message += standard_block
+    return message

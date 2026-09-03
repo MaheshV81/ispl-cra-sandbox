@@ -111,3 +111,11 @@ class Platform(ABC):
     def post_status(self, pr: PullRequest, name: str, conclusion: str,
                     title: str, summary: str) -> None:
         """Advisory status. `conclusion` is one of neutral, success, failure."""
+
+    @abstractmethod
+    def fetch_file(self, pr: PullRequest, path: str, ref: str) -> str | None:
+        """File content at a commit, or None if absent or binary.
+
+        Implements the read_file_at_ref and lookup_coding_standard tools that
+        authority.permitted_tools already allows. Read-only by construction.
+        """

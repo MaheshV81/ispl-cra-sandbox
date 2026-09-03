@@ -123,3 +123,18 @@ class GitHubPlatform(Platform):
             timeout=30)
         if r.status_code >= 300:
             print(f"::warning::check run failed ({r.status_code}): {r.text[:300]}")
+
+    def fetch_file(self, pr: PullRequest, path: str, ref: str) -> str | None:
+        try:
+            r = self.session.get(
+                f"{self.api}/repos/{pr.ref.repo}/contents/{path}",
+                params={"ref": ref},
+                headers={"Accept": "application/vnd.github.raw+json"},
+                timeout=30)
+            if r.status_code != 200:
+                return None
+            text = r.text
+            # Crude binary check: a NUL byte never appears in source we review.
+            return None if "\x00" in text[:2000] else text
+        except requests.RequestException:
+            return None

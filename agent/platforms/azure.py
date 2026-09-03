@@ -283,3 +283,6 @@ class AzureDevOpsPlatform(Platform):
         if r.status_code >= 300:
             print(f"::warning::azure status post failed "
                   f"({r.status_code}): {r.text[:300]}")
+
+    def fetch_file(self, pr: PullRequest, path: str, ref: str) -> str | None:
+        return self._file_at(self._repo_url(pr.ref.repo), path, ref) or None
