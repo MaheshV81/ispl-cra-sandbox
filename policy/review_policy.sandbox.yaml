@@ -53,6 +53,17 @@ scope:
   max_changed_files: 40
   max_diff_lines: 2000
   min_diff_lines: 1
+  bot_authors:
+    - "dependabot"
+    - "dependabot[bot]"
+    - "renovate"
+    - "renovate[bot]"
+    - "github-actions"
+    - "github-actions[bot]"
+    # Azure DevOps service identities. Verify these against your own
+    # organisation before relying on them — the display names are configurable.
+    - "Project Collection Build Service"
+    - "Microsoft.VisualStudio.Services.TFS"
   excluded_paths:
     - "**/.env*"
     - "**/*.pem"
