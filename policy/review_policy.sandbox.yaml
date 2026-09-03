@@ -268,7 +268,7 @@ cost:
 # surrounding code. Measure the trade on your own repos before assuming it pays.
 # ---------------------------------------------------------------------------
 context:
-  read_file_at_ref: false
+  read_file_at_ref: true
   # Files at or under this many lines are sent whole. Padded hunks miss
   # declarations far above the change, which is the main false-positive
   # source this feature addresses.
