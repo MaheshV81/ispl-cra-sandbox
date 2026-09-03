@@ -1,0 +1,143 @@
+name: AI Review (ISPL-CRA-001) — Variant B, escalation-only gate
+
+# VARIANT B. Do not deploy alongside variant A; pick one.
+#
+# Difference from variant A: the human approval gate applies only when the run
+# hits an authority.escalate_to_human_when condition. Routine reviews post
+# unattended.
+#
+# This requires a policy amendment. See docs/gate-decision-memo.md.
+# authority.human_approval_required must change from
+#   ["post_review_comment"]
+# to
+#   ["post_review_comment_when_escalated"]
+# Deploying this file against the unamended policy means the workflow is more
+# permissive than the policy it claims to enforce, which is worse than either
+# option on its own.
+#
+# The agent code is identical in both variants. main.py already emits
+# requires_human = bool(escalations) or "post_review_comment" in
+# authority.human_approval_required, so amending the policy flips the behaviour
+# without a code change.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: ispl-cra-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/ai-review') &&
+       !contains(github.event.comment.body, 'false-positive'))
+    runs-on: ${{ vars.AI_REVIEW_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.run.outputs.action }}
+      verdict: ${{ steps.run.outputs.verdict }}
+      requires_human: ${{ steps.run.outputs.requires_human }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            agent
+            policy
+            requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Resolve pull request context
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" \
+            | jq '{pull_request: ., action: "synchronize"}' > /tmp/pr_event.json
+          echo "GITHUB_EVENT_PATH=/tmp/pr_event.json" >> "$GITHUB_ENV"
+
+      - name: Run guardrailed analysis
+        id: run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_POLICY_PATH: policy/review_policy.yaml
+          ANTHROPIC_BASE_URL: ${{ vars.HIGRESS_GATEWAY_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.HIGRESS_CONSUMER_KEY }}
+          OLLAMA_BASE_URL: ${{ vars.OLLAMA_BASE_URL }}
+          REVIEW_PROJECT: ${{ vars.REVIEW_PROJECT }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ispl-cra
+          LANGSMITH_ENDPOINT: ${{ vars.LANGSMITH_ENDPOINT }}
+        run: python -m agent.main analyze
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ispl-cra-${{ github.run_id }}
+          path: |
+            review.json
+            audit/run.json
+          retention-days: 90
+
+  # ------------------------------------------------------------------
+  # Ungated path. Runs when no escalation condition fired: no blocker, no
+  # security finding, no sensitive path, validation clean, verdict is not
+  # request_changes. These are the reviews where a human clicking approve adds
+  # no signal.
+  # ------------------------------------------------------------------
+  publish-routine:
+    name: Publish (routine)
+    needs: analyze
+    if: needs.analyze.outputs.action == 'post' && needs.analyze.outputs.requires_human == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: ./.github/actions/publish-review
+        # See .github/actions/publish-review/action.yml — shared by both paths
+        # so they cannot drift apart.
+        with:
+          approved-by: automated-routine
+
+  # ------------------------------------------------------------------
+  # Gated path. Runs when an escalation condition fired. Same environment and
+  # the same named reviewers as variant A.
+  # ------------------------------------------------------------------
+  publish-escalated:
+    name: Publish (escalated — human approval)
+    needs: analyze
+    if: needs.analyze.outputs.action == 'post' && needs.analyze.outputs.requires_human == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: ai-review-publish
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+    steps:
+      - uses: ./.github/actions/publish-review
+        with:
+          approved-by: ${{ github.actor }}

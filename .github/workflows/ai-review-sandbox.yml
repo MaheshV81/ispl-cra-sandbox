@@ -1,0 +1,67 @@
+name: AI Review (sandbox)
+
+# SANDBOX WORKFLOW. Points at review_policy.sandbox.yaml, calls the Anthropic
+# API directly, and has no human approval gate. Use this to prove the agent runs
+# before deploying the governed version.
+#
+# Differences from the production workflow:
+#   - no ANTHROPIC_BASE_URL, so calls go straight to Anthropic instead of Higress
+#   - no OLLAMA_BASE_URL, because no project is restricted in the sandbox policy
+#   - one job, not two, because human_approval_required is empty
+#   - REVIEW_PROJECT hardcoded to SANDBOX so project detection never returns None
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+concurrency:
+  group: ispl-cra-sandbox-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  review:
+    name: AI Review (sandbox)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Analyze
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_POLICY_PATH: policy/review_policy.sandbox.yaml
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          REVIEW_PROJECT: SANDBOX
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ispl-cra
+        run: python -m agent.main analyze
+
+      - name: Publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_POLICY_PATH: policy/review_policy.sandbox.yaml
+          APPROVED_BY: sandbox-ungated
+        run: python -m agent.main publish
+
+      - name: Upload audit record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ispl-cra-audit-${{ github.run_id }}
+          path: audit/run.json
+          retention-days: 30
+          if-no-files-found: ignore

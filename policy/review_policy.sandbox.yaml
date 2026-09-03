@@ -1,0 +1,227 @@
+# SANDBOX POLICY — NOT THE GOVERNANCE POLICY.
+#
+# This is a test harness. It has the same structure as ISPL-CRA-001 so the agent
+# behaves identically, but the scope, project routing, and model are changed so
+# it can run on a personal repo with no Higress gateway and no on-prem Ollama.
+#
+# Do NOT deploy this to intertec repos. policy/review_policy.yaml is the real one.
+#
+# What differs from ISPL-CRA-001 v1.1.0, and why:
+#   allowed_repos     your sandbox instead of intertec/*
+#   restricted_*      emptied — you have no on-prem endpoint to route to
+#   default_model     Haiku instead of Sonnet, because testing should be cheap
+#   human_approval    removed, so you can see a full run without a gate first
+# Everything else — guardrails, evidence rules, verdict arithmetic, phase 1
+# advisory behaviour — is identical.
+
+policy_id: ISPL-CRA-SANDBOX
+policy_version: "1.1.0-sandbox"
+owner: "Mahesh Vaidhyanathan"
+effective_from: "2026-09-03"
+review_cycle_days: 90
+
+trigger:
+  surface: "github_pull_request"
+  granularity: "pull_request"
+  events:
+    - "pull_request.opened"
+    - "pull_request.ready_for_review"
+    - "pull_request.synchronize"
+    - "issue_comment"
+  manual_command: "/ai-review"
+  re_review_mode: "incremental_since_last_reviewed_sha"
+  skip_when:
+    - "pull request is in draft state"
+    - "label present: no-ai-review"
+    - "label present: wip"
+    - "author is a bot: dependabot, renovate, github-actions"
+    - "every changed file matches scope.excluded_paths"
+    - "head_sha already reviewed"
+  rate_limits:
+    max_runs_per_pull_request: 5
+    cooldown_seconds: 30      # 120 in production; shortened so you can iterate
+    concurrent_runs_per_pull_request: 1
+
+scope:
+  # ---------------------------------------------------------------
+  # EDIT THIS LINE. Replace with your own GitHub owner/repo.
+  # If you leave it wrong, every run stops with
+  # "repo <name> is outside scope.allowed_repos" and posts nothing.
+  # ---------------------------------------------------------------
+  allowed_repos:
+    - "MaheshV81/ispl-cra-sandbox"
+  max_changed_files: 40
+  max_diff_lines: 2000
+  min_diff_lines: 1
+  excluded_paths:
+    - "**/.env*"
+    - "**/*.pem"
+    - "**/*.key"
+    - "**/*.p12"
+    - "**/secrets/**"
+    - "**/node_modules/**"
+    - "**/*.lock"
+    - "**/package-lock.json"
+    - "**/*.min.js"
+    - "**/dist/**"
+    - "**/*.snap"
+  sensitive_paths:
+    - "**/auth/**"
+    - "**/payments/**"
+    - "**/migrations/**"
+    - "**/infra/**"
+    - "**/*iam*"
+    - "**/.github/workflows/**"
+
+data:
+  # Haiku, not Sonnet. A sandbox PR costs a fraction of a cent this way and the
+  # guardrails you are testing are model-independent.
+  default_model: "anthropic:claude-haiku-4-5-20251001"
+  # Empty. With no restricted projects, route_model always returns the default
+  # and never looks for an Ollama endpoint you do not have.
+  restricted_projects: []
+  restricted_model: "ollama:qwen2.5-coder:32b"
+  # "default", not "restricted". This is the one setting that would otherwise
+  # silently route your sandbox to a nonexistent on-prem model and abstain.
+  unknown_project_behaviour: "default"
+  redact:
+    - "email"
+    - "ip"
+    - "api_key"
+  block_patterns:
+    private_key: "-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----"
+    aws_access_key: "AKIA[0-9A-Z]{16}"
+    bearer_token: "(?i)bearer\\s+[A-Za-z0-9\\-._~+/]{24,}"
+    jwt: "eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}"
+
+authority:
+  permitted_tools:
+    - "fetch_diff"
+    - "read_file_at_ref"
+    - "search_repo"
+    - "get_ci_status"
+    - "lookup_coding_standard"
+    - "post_review_comment"
+  forbidden_actions:
+    - "approve_pull_request"
+    - "merge"
+    - "push"
+    - "force_push"
+    - "close_pull_request"
+    - "delete_branch"
+    - "modify_ci_configuration"
+    - "assign_reviewers"
+    - "run_shell"
+  # Empty for the first run so you can watch a review post end to end without a
+  # gate. Add "post_review_comment" back once you have seen it work.
+  human_approval_required: []
+  escalate_to_human_when:
+    - "any finding of severity blocker"
+    - "any finding in category security"
+    - "any changed file matches sensitive_paths"
+    - "output validation failed"
+    - "model confidence below floor"
+
+review:
+  dimensions:
+    - "security"
+    - "correctness"
+    - "performance"
+    - "maintainability"
+    - "test_coverage"
+  severities: ["blocker", "major", "minor", "nit"]
+  max_findings: 25
+  confidence_floor: 0.70
+  evidence_rules:
+    file_must_exist_in_diff: true
+    line_must_exist_in_diff: true
+    require_suggested_fix_for: ["blocker", "major"]
+    require_rationale: true
+  prohibited_output:
+    - "praise without a finding"
+    - "style opinions already enforced by the linter"
+    - "rewriting whole files"
+    - "speculation about intent of the author"
+  verdict_rules:
+    request_changes_if_blockers: 1
+    request_changes_if_majors: 3
+    needs_discussion_if_majors: 1
+    otherwise: "comment_only"
+
+output:
+  summary_comment:
+    enabled: true
+    idempotency_marker: "<!-- ispl-cra:sandbox -->"
+    sections:
+      - "verdict and finding counts"
+      - "blocker and major findings as a table"
+      - "minor and nit findings inside a collapsed block"
+      - "what was not reviewed and why"
+      - "footer: policy version, model used, run id"
+  inline_comments:
+    enabled: true
+    severities: ["blocker", "major"]
+    max_per_pull_request: 10
+    use_github_suggestion_blocks: true
+  check_run:
+    name: "AI Review (sandbox)"
+    reports: ["verdict", "blocker_count", "major_count"]
+  tone:
+    - "state the defect and the fix, no praise padding"
+    - "one finding per comment"
+    - "never address the author personally"
+  feedback_capture:
+    reaction: true
+    reply_command: "/ai-review false-positive"
+
+branch_protection:
+  current_phase: 1
+  phases:
+    1:
+      name: "Advisory"
+      check_blocking: false
+      description: "Agent comments only. Merge is never gated."
+      exit_criteria: "sandbox — no exit criteria"
+    2:
+      name: "Security gate"
+      check_blocking: true
+      blocking_categories: ["security"]
+      blocking_severities: ["blocker"]
+      description: "Only a security blocker fails the check."
+      exit_criteria: "sandbox — no exit criteria"
+    3:
+      name: "Full gate"
+      check_blocking: true
+      blocking_severities: ["blocker"]
+      description: "Any blocker fails the check, in any category."
+  invariants:
+    - "the agent check never counts toward a required human approval"
+    - "at least one human approval is required on every protected branch"
+    - "a failing agent check is always overridable by a named human"
+  override:
+    label: "ai-review-override"
+    authorised_roles: ["tech_lead", "engineering_manager"]
+    justification_required: true
+    logged_to_audit: true
+
+audit:
+  log_fields:
+    - "run_id"
+    - "policy_version"
+    - "repo"
+    - "project"
+    - "pr_ref"
+    - "head_sha"
+    - "trigger_event"
+    - "model_used"
+    - "prompt_hash"
+    - "input_tokens"
+    - "output_tokens"
+    - "findings_count"
+    - "verdict"
+    - "guardrail_blocks"
+    - "human_decision"
+    - "override_used"
+    - "false_positives_reported"
+  retention_days: 365
+  redact_code_in_logs: true

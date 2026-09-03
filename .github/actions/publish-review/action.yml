@@ -1,0 +1,52 @@
+name: Publish ISPL-CRA review
+description: >-
+  Posts the analysed review. Shared by the routine and escalated paths in
+  variant B so the two cannot drift apart. If they drifted, the ungated path
+  could quietly gain behaviour the gated path was reviewed for.
+
+inputs:
+  approved-by:
+    description: >-
+      Who authorised the post. "automated-routine" on the ungated path, the
+      approving actor's login on the gated path. Written to the audit record as
+      human_decision, so the audit trail distinguishes a real approval from an
+      automatic one rather than implying a human looked at every review.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        sparse-checkout: |
+          agent
+          policy
+          requirements.txt
+        sparse-checkout-cone-mode: false
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+        cache: pip
+        cache-dependency-path: requirements.txt
+
+    - run: pip install -r requirements.txt
+      shell: bash
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: ispl-cra-${{ github.run_id }}
+
+    - name: Post review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        REVIEW_POLICY_PATH: policy/review_policy.yaml
+        APPROVED_BY: ${{ inputs.approved-by }}
+      run: python -m agent.main publish
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: ispl-cra-audit-${{ github.run_id }}
+        path: audit/run.json
+        retention-days: 90

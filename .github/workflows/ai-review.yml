@@ -1,0 +1,147 @@
+name: AI Review (ISPL-CRA-001)
+
+# The policy requires human approval for post_review_comment, so analysis and
+# posting are separate jobs. `analyze` holds no write permission at all;
+# `publish` holds the write permission and cannot start until a named human
+# approves the environment. That split is what makes the approval real.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  # rate_limits.concurrent_runs_per_pull_request: 1
+  group: ispl-cra-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze
+    # Manual command path: only run on issue_comment when it is a PR and the
+    # comment is the documented command.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.issue.pull_request != null &&
+       startsWith(github.event.comment.body, '/ai-review') &&
+       !contains(github.event.comment.body, 'false-positive'))
+    # Restricted projects must run where the on-prem model is reachable. Set the
+    # repo variable AI_REVIEW_RUNNER to a self-hosted label on those repos.
+    # Leaving it unset on a restricted repo means the run abstains rather than
+    # reaching for the external model.
+    runs-on: ${{ vars.AI_REVIEW_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      action: ${{ steps.run.outputs.action }}
+      verdict: ${{ steps.run.outputs.verdict }}
+      requires_human: ${{ steps.run.outputs.requires_human }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            agent
+            policy
+            requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - name: Resolve pull request context
+        if: github.event_name == 'issue_comment'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # issue_comment payloads carry no pull_request object. Materialise one
+          # so the agent sees the same shape on both trigger paths.
+          gh api "repos/${{ github.repository }}/pulls/${{ github.event.issue.number }}" \
+            | jq '{pull_request: ., action: "synchronize"}' > /tmp/pr_event.json
+          echo "GITHUB_EVENT_PATH=/tmp/pr_event.json" >> "$GITHUB_ENV"
+
+      - name: Run guardrailed analysis
+        id: run
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_POLICY_PATH: policy/review_policy.yaml
+          # Unrestricted route.
+          ANTHROPIC_BASE_URL: ${{ vars.HIGRESS_GATEWAY_URL }}
+          ANTHROPIC_API_KEY: ${{ secrets.HIGRESS_CONSUMER_KEY }}
+          # Restricted route. On-prem only, reachable from the self-hosted runner.
+          OLLAMA_BASE_URL: ${{ vars.OLLAMA_BASE_URL }}
+          # Optional override when the project code is not discoverable from the repo.
+          REVIEW_PROJECT: ${{ vars.REVIEW_PROJECT }}
+        run: python -m agent.main analyze
+
+      - name: Upload review payload and audit record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ispl-cra-${{ github.run_id }}
+          path: |
+            review.json
+            audit/run.json
+          retention-days: 90
+
+  publish:
+    name: Publish review
+    needs: analyze
+    if: needs.analyze.outputs.action == 'post'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # authority.human_approval_required: [post_review_comment]
+    # Configure this environment with required reviewers (tech_lead,
+    # engineering_manager). The job blocks here until one of them approves.
+    environment:
+      name: ai-review-publish
+    permissions:
+      contents: read
+      pull-requests: write
+      checks: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            agent
+            policy
+            requirements.txt
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - run: pip install -r requirements.txt
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ispl-cra-${{ github.run_id }}
+
+      - name: Post review
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_POLICY_PATH: policy/review_policy.yaml
+          APPROVED_BY: ${{ github.actor }}
+        run: python -m agent.main publish
+
+      - name: Upload completed audit record
+        uses: actions/upload-artifact@v4
+        with:
+          name: ispl-cra-audit-${{ github.run_id }}
+          path: audit/run.json
+          # audit.retention_days is 365; GitHub artifacts cap at 90. Ship these
+          # to your log store to meet the policy. See README.
+          retention-days: 90
