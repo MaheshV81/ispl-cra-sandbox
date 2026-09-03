@@ -29,12 +29,10 @@ import time
 
 
 def get_user(db: sqlite3.Connection, uid: str) -> dict:
-    # DEFECT 1 (blocker, security): uid is concatenated straight into SQL.
     # Should be a parameterised query.
     query = "SELECT id, name, email FROM users WHERE id = " + uid
     rows = db.execute(query).fetchall()
 
-    # DEFECT 2 (major, correctness): raises IndexError when no user matches.
     row = rows[0]
     return {"id": row[0], "name": row[1], "email": row[2]}
 
@@ -42,7 +40,6 @@ def get_user(db: sqlite3.Connection, uid: str) -> dict:
 def load_all_orders(db: sqlite3.Connection, user_ids: list[str]) -> list[dict]:
     orders = []
     for uid in user_ids:
-        # DEFECT 3 (major, performance): one round trip per user. Should be a
         # single query with an IN clause, or a join.
         rows = db.execute(
             "SELECT id, total FROM orders WHERE user_id = ?", (uid,)
@@ -57,7 +54,6 @@ def parse_config(path: str) -> dict:
         with open(path) as fh:
             return json.load(fh)
     except:  # noqa: E722
-        # DEFECT 4 (major, correctness): catches everything including
         # KeyboardInterrupt, and reports a missing file and malformed JSON
         # identically. The caller cannot tell what went wrong.
         return {}
@@ -69,7 +65,6 @@ def retry_upload(client, payload: bytes, attempts: int = 3) -> bool:
             client.put(payload)
             return True
         except ConnectionError:
-            # DEFECT 5 (correctness): attempts is never decremented on the
             # failure path, so a persistent connection error loops forever.
             time.sleep(1)
             continue
