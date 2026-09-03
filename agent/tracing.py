@@ -22,6 +22,15 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+# Set at import, before any client is constructed and before any
+# auto-instrumentation can fire. Client(hide_inputs=...) only masks traces sent
+# through that one client instance; anything else instrumenting the model SDK
+# uses its own client and ignores it. These variables are global and apply to
+# every trace the process emits, which is the only version of this control that
+# actually holds.
+os.environ.setdefault("LANGSMITH_HIDE_INPUTS", "true")
+os.environ.setdefault("LANGSMITH_HIDE_OUTPUTS", "true")
+
 _ENABLED = False
 _DISABLED_REASON = "not configured"
 _CLIENT: Any = None
@@ -66,7 +75,18 @@ def configure(*, restricted: bool, project: str | None, run_id: str, repo: str,
         hide_outputs=True,
     )
     os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_HIDE_INPUTS"] = "true"
+    os.environ["LANGSMITH_HIDE_OUTPUTS"] = "true"
     os.environ.setdefault("LANGSMITH_PROJECT", "ispl-cra")
+
+    # Fail closed. If the masking variables are not set at this point, do not
+    # trace at all: a trace carrying the diff is worse than no trace.
+    if (os.environ.get("LANGSMITH_HIDE_INPUTS") != "true"
+            or os.environ.get("LANGSMITH_HIDE_OUTPUTS") != "true"):
+        _hard_disable()
+        _DISABLED_REASON = "input/output masking could not be enforced"
+        print(f"::warning::tracing disabled — {_DISABLED_REASON}")
+        return False
 
     _METADATA = {
         "run_id": run_id,
@@ -89,6 +109,10 @@ def _hard_disable() -> None:
     for var in _LS_VARS:
         os.environ.pop(var, None)
     os.environ["LANGSMITH_TRACING"] = "false"
+    # Left set deliberately. If anything re-enables tracing later in the
+    # process, it must still not be able to ship inputs or outputs.
+    os.environ["LANGSMITH_HIDE_INPUTS"] = "true"
+    os.environ["LANGSMITH_HIDE_OUTPUTS"] = "true"
 
 
 def enabled() -> bool:
@@ -127,14 +151,11 @@ def wrap_model_client(client: Any) -> Any:
 
     Returns the client untouched when tracing is off.
     """
-    if not _ENABLED:
-        return client
-    try:
-        from langsmith.wrappers import wrap_anthropic
-        return wrap_anthropic(client)
-    except Exception as exc:  # noqa: BLE001
-        print(f"::warning::could not wrap model client for tracing: {exc}")
-        return client
+    # Deliberately a no-op. wrap_anthropic in langsmith 0.12.1 raises
+    # "'Anthropic' object has no attribute 'completions'", and the model call is
+    # instrumented anyway without it. Kept as a seam so the call sites do not
+    # change if a working wrapper appears later.
+    return client
 
 
 def record_outcome(*, verdict: str, findings_count: int, rejected_count: int,

@@ -104,7 +104,25 @@ def analyze() -> int:
         _write_outcome({"action": "skip", "reason": reason, "escalate": escalate,
                         "head_sha": head_sha, "pr_number": pr_number, "repo": repo,
                         "run_id": run_id})
-        print(f"::notice::{reason}")
+
+        # An abstain is not a clean review, and the two must not look alike in
+        # the Actions UI. Phase 1 forbids failing the check, so the signal goes
+        # into an error annotation and a neutral check run with an honest title.
+        if verdict == "abstained" or escalate:
+            print(f"::error title=AI Review abstained::{reason}")
+            try:
+                check = policy.get("output.check_run")
+                gh.post_check_run(
+                    repo, head_sha, check["name"], "neutral",
+                    title=f"abstained — {verdict}",
+                    summary=f"The agent did not review this pull request.\n\n"
+                            f"Reason: {reason}\n\n"
+                            f"This is not an approval. No findings were produced.",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"::warning::could not post abstain check run: {exc}")
+        else:
+            print(f"::notice::{reason}")
         return 0
 
     # ---- stage 1a: scope admission ---------------------------------------
