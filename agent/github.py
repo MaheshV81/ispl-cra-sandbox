@@ -179,3 +179,25 @@ def post_check_run(repo: str, head_sha: str, name: str, conclusion: str,
     )
     if r.status_code >= 300:
         print(f"::warning::check run creation failed ({r.status_code}): {r.text[:300]}")
+
+
+def fetch_file(repo: str, path: str, ref: str) -> str | None:
+    """Raw file content at a commit. Implements read_file_at_ref.
+
+    Read-only: this module has no method that writes to a repository, which is
+    a stronger guarantee than checking permissions at call time.
+    """
+    try:
+        r = _session.get(
+            f"{API}/repos/{repo}/contents/{path}",
+            params={"ref": ref},
+            headers={"Accept": "application/vnd.github.raw+json"},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            return None
+        text = r.text
+        # A NUL byte in the first couple of KB means binary; skip it.
+        return None if "\x00" in text[:2000] else text
+    except requests.RequestException:
+        return None

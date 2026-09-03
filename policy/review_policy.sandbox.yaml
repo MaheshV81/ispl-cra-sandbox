@@ -263,7 +263,15 @@ cost:
 # on changes what the agent sees, and that should be a decision rather than an
 # inherited default.
 #
-# Cost: context expansion typically adds 30-60% to input tokens. It exists to
+# Cost: MEASURED, not estimated. On a 200-line diff across three 350-line
+# files, context expansion took the prompt from ~1,650 to ~10,550 tokens — a
+# 540% increase at the original defaults. Context dominates the prompt when
+# files are large relative to the change, which is the common case.
+#
+# The defaults below are the conservative starting point: whole files only
+# under 200 lines, and a hard 600-line ceiling across the whole run. Raise
+# them only after measuring what the extra tokens buy you in fewer rejected
+# findings. More context is not free and is not automatically better. It exists to
 # remove the false positives caused by the agent judging a diff without the
 # surrounding code. Measure the trade on your own repos before assuming it pays.
 # ---------------------------------------------------------------------------
@@ -272,10 +280,10 @@ context:
   # Files at or under this many lines are sent whole. Padded hunks miss
   # declarations far above the change, which is the main false-positive
   # source this feature addresses.
-  whole_file_under_lines: 400
+  whole_file_under_lines: 200
   lines_around_hunk: 25
   max_file_lines: 1500
-  max_total_lines: 1200
+  max_total_lines: 600
 
   # Reads .ai-review/CONVENTIONS.md (or .github/CONVENTIONS.md, or
   # CONVENTIONS.md) from the repository under review.

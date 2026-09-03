@@ -25,6 +25,7 @@ from . import policy
 from . import render
 from . import tracing
 from . import usage as usage_mod
+from . import context as ctx
 from .diff import build_index
 
 STATE_RE = re.compile(r"<!-- ispl-cra-state: (.*?) -->", re.DOTALL)
@@ -206,7 +207,27 @@ def analyze() -> int:
     if not tracing.enabled():
         print(f"::notice::tracing off — {tracing.disabled_reason()}")
 
-    user_msg = ml.build_user_message(pr, files, sensitive_hits, gr.redact)
+    # read_file_at_ref and lookup_coding_standard. Both policy-gated and both
+    # default off, so this is a no-op unless someone turned them on.
+    def _fetch(path: str) -> str | None:
+        return gh.fetch_file(repo, path, head_sha)
+
+    contexts = ctx.build(files, _fetch)
+    context_block = ctx.render(contexts)
+    audit["context_lines_supplied"] = sum(len(c.lines) for c in contexts.values())
+
+    standard = ctx.load_standard(_fetch)
+    standard_block = ctx.render_standard(standard[0]) if standard else ""
+    audit["conventions_hash"] = standard[1] if standard else None
+
+    if context_block:
+        print(f"context: {audit['context_lines_supplied']} lines across "
+              f"{len(contexts)} file(s)")
+    if standard:
+        print(f"coding standard loaded (hash {standard[1]})")
+
+    user_msg = ml.build_user_message(pr, files, sensitive_hits, gr.redact,
+                                     context_block, standard_block)
     audit["prompt_hash"] = render.prompt_hash(ml.SYSTEM_PROMPT, user_msg)
 
     # Budget ceiling, checked BEFORE the call. Spend that has already happened
