@@ -35,6 +35,7 @@ _ENABLED = False
 _DISABLED_REASON = "not configured"
 _CLIENT: Any = None
 _METADATA: dict[str, Any] = {}
+_ROOT_RUN_ID: str | None = None
 
 # Env vars LangSmith reads. Cleared wholesale when tracing must not happen, so
 # that a stray import cannot re-enable it.
@@ -135,10 +136,20 @@ def span(name: str, run_type: str = "chain") -> Callable:
             if not _ENABLED:
                 return fn(*args, **kwargs)
             from langsmith import traceable
+            from langsmith.run_helpers import get_current_run_tree
+
+            def inner(*a, **kw):
+                global _ROOT_RUN_ID
+                tree = get_current_run_tree()
+                if tree is not None and _ROOT_RUN_ID is None:
+                    _ROOT_RUN_ID = str(tree.id)
+                return fn(*a, **kw)
+
+            inner.__name__ = getattr(fn, "__name__", name)
             traced = traceable(
                 name=name, run_type=run_type, client=_CLIENT,
                 metadata=_METADATA,
-            )(fn)
+            )(inner)
             return traced(*args, **kwargs)
         wrapper.__name__ = getattr(fn, "__name__", name)
         wrapper.__doc__ = getattr(fn, "__doc__", None)
@@ -178,7 +189,8 @@ def record_outcome(*, verdict: str, findings_count: int, rejected_count: int,
     """
     if not _ENABLED or _CLIENT is None:
         return
-    return
+    if _ROOT_RUN_ID is None:
+        return
     run_id = _METADATA.get("run_id")
     try:
         for key, value in (
@@ -189,7 +201,7 @@ def record_outcome(*, verdict: str, findings_count: int, rejected_count: int,
             ("escalated", bool(escalations)),
         ):
             _CLIENT.create_feedback(
-                run_id=None, key=key,
+                run_id=_ROOT_RUN_ID, key=key,
                 score=value if isinstance(value, (int, float, bool)) else None,
                 value=value if isinstance(value, str) else None,
                 comment=f"ispl-cra run {run_id}",
