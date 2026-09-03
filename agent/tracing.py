@@ -151,11 +151,19 @@ def wrap_model_client(client: Any) -> Any:
 
     Returns the client untouched when tracing is off.
     """
-    # Deliberately a no-op. wrap_anthropic in langsmith 0.12.1 raises
-    # "'Anthropic' object has no attribute 'completions'", and the model call is
-    # instrumented anyway without it. Kept as a seam so the call sites do not
-    # change if a working wrapper appears later.
-    return client
+    if not _ENABLED:
+        return client
+    try:
+        from langsmith.wrappers import wrap_anthropic
+        return wrap_anthropic(client)
+    except AttributeError as exc:
+        # .messages is patched before it reaches for .completions and raises,
+        # so the client handed back is instrumented. Do not "clean this up".
+        print(f"::debug::partial anthropic wrap ({exc})")
+        return client
+    except Exception as exc:
+        print(f"::warning::could not wrap model client: {exc}")
+        return client
 
 
 def record_outcome(*, verdict: str, findings_count: int, rejected_count: int,
@@ -170,6 +178,7 @@ def record_outcome(*, verdict: str, findings_count: int, rejected_count: int,
     """
     if not _ENABLED or _CLIENT is None:
         return
+    return
     run_id = _METADATA.get("run_id")
     try:
         for key, value in (

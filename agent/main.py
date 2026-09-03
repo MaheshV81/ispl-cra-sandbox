@@ -182,7 +182,8 @@ def analyze() -> int:
     audit["prompt_hash"] = render.prompt_hash(ml.SYSTEM_PROMPT, user_msg)
 
     try:
-        payload, tool_calls, usage = ml.invoke(model_id, restricted, user_msg)
+        invoke_traced = tracing.span("review_diff", "llm")(ml.invoke)
+        payload, tool_calls, usage = invoke_traced(model_id, restricted, user_msg)
     except Exception as exc:  # noqa: BLE001
         # No fallback. A restricted backend outage abstains to a human.
         return stop(f"model call failed on {model_id}: {exc}", escalate=True,
