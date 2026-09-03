@@ -133,6 +133,7 @@ def span(name: str, run_type: str = "chain") -> Callable:
     restricted run, so call sites need no conditionals."""
     def decorator(fn: Callable) -> Callable:
         def wrapper(*args, **kwargs):
+            global _ROOT_RUN_ID
             if not _ENABLED:
                 return fn(*args, **kwargs)
             from langsmith import traceable
@@ -168,12 +169,15 @@ def wrap_model_client(client: Any) -> Any:
         from langsmith.wrappers import wrap_anthropic
         return wrap_anthropic(client)
     except AttributeError as exc:
-        # .messages is patched before it reaches for .completions and raises,
-        # so the client handed back is instrumented. Do not "clean this up".
-        print(f"::debug::partial anthropic wrap ({exc})")
+        # langsmith 0.12.1 patches client.messages first, then reaches for
+        # client.completions, which the current Anthropic SDK does not expose.
+        # By the time it raises, .messages is already instrumented, so the
+        # client we hand back is traced. Removing this call removes tracing of
+        # the model call entirely — do not "clean it up".
+        print(f"::debug::partial anthropic wrap ({exc}); messages is instrumented")
         return client
-    except Exception as exc:
-        print(f"::warning::could not wrap model client: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"::warning::could not wrap model client for tracing: {exc}")
         return client
 
 
@@ -190,6 +194,10 @@ def record_outcome(*, verdict: str, findings_count: int, rejected_count: int,
     if not _ENABLED or _CLIENT is None:
         return
     if _ROOT_RUN_ID is None:
+        # No traced span ran, so there is nothing to attach feedback to. Skip
+        # quietly: the outcome is already in audit/run.json, which is the record
+        # that the policy actually requires.
+        print("::debug::no traced span; outcome recorded in audit log only")
         return
     run_id = _METADATA.get("run_id")
     try:

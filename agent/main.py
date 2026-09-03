@@ -24,9 +24,37 @@ from . import model as ml
 from . import policy
 from . import render
 from . import tracing
+from . import usage as usage_mod
 from .diff import build_index
 
 STATE_RE = re.compile(r"<!-- ispl-cra-state: (.*?) -->", re.DOTALL)
+
+
+def _tokens_spent_on_pr(repo: str, pr_number: int, marker: str) -> int:
+    """Tokens already spent reviewing this pull request.
+
+    Read back from the state block in prior summary comments. The workflow
+    runner is ephemeral, so this is the only place a running total can live
+    without standing up a database. It is also why the ceiling is per-pull-
+    request rather than per-day: a PR comment can carry PR-scoped state and
+    nothing else.
+    """
+    total = 0
+    try:
+        for c in gh._paginate(f"{gh.API}/repos/{repo}/issues/{pr_number}/comments"):
+            body = c.get("body") or ""
+            if marker not in body:
+                continue
+            m = STATE_RE.search(body)
+            if not m:
+                continue
+            try:
+                total += int(json.loads(m.group(1)).get("tokens_this_run", 0))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+    except Exception:  # noqa: BLE001 - never fail a review over accounting
+        return 0
+    return total
 
 
 def _load_event() -> dict:
@@ -181,6 +209,16 @@ def analyze() -> int:
     user_msg = ml.build_user_message(pr, files, sensitive_hits, gr.redact)
     audit["prompt_hash"] = render.prompt_hash(ml.SYSTEM_PROMPT, user_msg)
 
+    # Budget ceiling, checked BEFORE the call. Spend that has already happened
+    # cannot be refused, so a post-hoc check is a report, not a control.
+    spent_before = _tokens_spent_on_pr(repo, pr_number, marker)
+    budget = usage_mod.check_before_call(user_msg, spent_before)
+    audit["tokens_spent_before_run"] = spent_before
+    audit["estimated_prompt_tokens"] = budget.estimated_tokens
+    if not budget.allowed:
+        return stop(f"budget ceiling: {budget.reason}", escalate=True,
+                    verdict="budget_exceeded")
+
     try:
         invoke_traced = tracing.span("review_diff", "llm")(ml.invoke)
         payload, tool_calls, usage = invoke_traced(model_id, restricted, user_msg)
@@ -189,8 +227,17 @@ def analyze() -> int:
         return stop(f"model call failed on {model_id}: {exc}", escalate=True,
                     verdict="abstained")
 
-    audit["input_tokens"] = usage.get("input_tokens", 0)
-    audit["output_tokens"] = usage.get("output_tokens", 0)
+    # Every token field the provider returned, not just the two headline ones.
+    for key, value in usage.items():
+        audit[key] = value
+    run_usage = usage_mod.Usage(
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_creation_input_tokens=usage.get("cache_creation_input_tokens", 0),
+        cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
+    )
+    audit["cost_usd"] = usage_mod.cost_usd(run_usage, model_id)
+    audit["tokens_spent_on_pr_total"] = spent_before + run_usage.total
 
     # ---- stage 3: block write actions ------------------------------------
     writes = gr.assert_no_write_action(tool_calls)
@@ -234,9 +281,17 @@ def analyze() -> int:
         not_reviewed=not_reviewed, model_used=model_id, run_id=run_id,
         head_sha=head_sha, escalations=escalations,
     )
-    state = {"findings": [{k: f[k] for k in ("path", "line", "severity", "category", "title")}
-                          for f in combined if f["severity"] in ("blocker", "major")]}
+    state = {
+        "findings": [{k: f[k] for k in ("path", "line", "severity", "category", "title")}
+                     for f in combined if f["severity"] in ("blocker", "major")],
+        "tokens_this_run": run_usage.total,
+        "cost_usd": audit["cost_usd"],
+    }
     summary += f"\n<!-- ispl-cra-state: {json.dumps(state)} -->"
+
+    summary += ("\n\n<sub>"
+                + usage_mod.format_ledger_line(run_usage, model_id, spent_before)
+                + "</sub>")
 
     inline = render.select_inline(combined, index)
 

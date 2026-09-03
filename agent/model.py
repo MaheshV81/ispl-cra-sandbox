@@ -112,8 +112,10 @@ def _anthropic_call(model_id: str, user_msg: str) -> tuple[dict, list[str], dict
     for b in resp.content:
         if b.type == "tool_use" and b.name == "report_review":
             payload = b.input
-    usage = {"input_tokens": resp.usage.input_tokens,
-             "output_tokens": resp.usage.output_tokens}
+    from .usage import from_anthropic
+    # Full breakdown, including cache tokens. input_tokens alone understates
+    # what the provider actually bills on any cached prompt.
+    usage = from_anthropic(resp).as_dict()
     return payload, tool_calls, usage
 
 
@@ -150,8 +152,8 @@ def _ollama_call(model_id: str, user_msg: str) -> tuple[dict, list[str], dict]:
         payload = json.loads(content)
     except json.JSONDecodeError as exc:
         raise ValueError(f"restricted model returned unparseable output: {exc}") from exc
-    usage = {"input_tokens": body.get("prompt_eval_count", 0),
-             "output_tokens": body.get("eval_count", 0)}
+    from .usage import from_ollama
+    usage = from_ollama(body).as_dict()
     return payload, ["report_review"], usage
 
 

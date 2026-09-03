@@ -204,6 +204,46 @@ branch_protection:
     justification_required: true
     logged_to_audit: true
 
+# ---------------------------------------------------------------------------
+# PROPOSED AMENDMENT to ISPL-CRA-001. Not in v1.1.0.
+#
+# The agent enforces these as a CEILING, checked before the model call. That is
+# not the same as a quota: it runs inside the agent, so it can only stop the
+# agent. A misconfigured deployment, a second agent, or anything calling the API
+# directly is unaffected. The hard quota belongs at the gateway
+# (higress/ai-review-gateway.yaml, ai-token-ratelimit.yaml), where the caller
+# cannot reach it. Describe this to Governance as defence in depth, not as
+# spend control.
+# ---------------------------------------------------------------------------
+cost:
+  # Refuse the call if the estimated prompt exceeds this. Catches an oversized
+  # diff before it is paid for rather than after.
+  max_tokens_per_run: 60000
+
+  # Cumulative across every run on one pull request, read back from prior
+  # summary comments. Catches the push-forty-times case.
+  max_tokens_per_pull_request: 400000
+
+  # RATES ARE UNVERIFIED PLACEHOLDERS. Check them against Anthropic's published
+  # pricing before quoting any figure from this system in a budget conversation.
+  # A model with no entry here records tokens and reports cost as null, which is
+  # deliberate: an absent cost prompts a question, a wrong one gets quoted.
+  rates_usd_per_million_tokens:
+    "anthropic:claude-haiku-4-5-20251001":
+      input: 1.00
+      output: 5.00
+      cache_write: 1.25
+      cache_read: 0.10
+    "anthropic:claude-sonnet-4-6":
+      input: 3.00
+      output: 15.00
+      cache_write: 3.75
+      cache_read: 0.30
+    # On-prem. No per-token cost; the expense is the hardware.
+    "ollama:qwen2.5-coder:32b":
+      input: 0.0
+      output: 0.0
+
 audit:
   log_fields:
     - "run_id"
@@ -217,6 +257,13 @@ audit:
     - "prompt_hash"
     - "input_tokens"
     - "output_tokens"
+    - "cache_creation_input_tokens"
+    - "cache_read_input_tokens"
+    - "total_tokens"
+    - "estimated_prompt_tokens"
+    - "tokens_spent_before_run"
+    - "tokens_spent_on_pr_total"
+    - "cost_usd"
     - "findings_count"
     - "verdict"
     - "guardrail_blocks"
