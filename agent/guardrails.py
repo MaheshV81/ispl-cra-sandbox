@@ -146,7 +146,15 @@ def scan_for_secrets(files: list[ChangedFile]) -> Decision:
 
 
 REDACTORS = {
-    "email": (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[redacted-email]"),
+    # The local part MUST start with an alphanumeric. Without that anchor the
+    # diff's own "+" marker is a valid local part, so "+@app.post(...)" reads as
+    # an email address and the decorator is redacted out of the code under
+    # review. That silently corrupted every Python file using @module.method
+    # decorators — Flask, FastAPI, pytest — and the model then reported the
+    # mangled syntax as a defect. Found by the agent reviewing this repository.
+    "email": (re.compile(
+        r"\b[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\b"),
+        "[redacted-email]"),
     "ip": (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[redacted-ip]"),
     "api_key": (re.compile(r"(?i)\b(?:api[_-]?key|apikey|access[_-]?token)\b\s*[:=]\s*"
                            r"['\"]?[A-Za-z0-9\-._~+/]{12,}['\"]?"), "[redacted-api-key]"),
