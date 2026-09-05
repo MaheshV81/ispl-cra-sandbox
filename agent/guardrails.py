@@ -32,8 +32,18 @@ class Decision:
 # Stage 1a — scope admission
 # --------------------------------------------------------------------------
 
-BOT_AUTHORS = {"dependabot", "dependabot[bot]", "renovate", "renovate[bot]",
-               "github-actions", "github-actions[bot]"}
+# Read from policy, not hardcoded. Azure DevOps bot identities look nothing
+# like GitHub's, so a hardcoded GitHub list means the bot-author skip silently
+# never fires on Azure — a guardrail that passes without checking anything.
+_FALLBACK_BOTS = {"dependabot", "dependabot[bot]", "renovate", "renovate[bot]",
+                  "github-actions", "github-actions[bot]"}
+
+
+def _bot_authors() -> set[str]:
+    try:
+        return {b.lower() for b in policy.get("scope.bot_authors")}
+    except Exception:  # noqa: BLE001 - policy predates this key
+        return _FALLBACK_BOTS
 
 
 def check_scope(pr: dict, repo: str, labels: set[str], reviewed_shas: set[str],
@@ -41,8 +51,15 @@ def check_scope(pr: dict, repo: str, labels: set[str], reviewed_shas: set[str],
     trig = policy.get("trigger")
     scope = policy.get("scope")
 
-    if not matches_any(repo, scope["allowed_repos"]):
-        return Decision(False, f"repo {repo} is outside scope.allowed_repos")
+    # Scope is matched against the platform-qualified name, e.g.
+    # "github:intertec/edmp-core" or "azure:intertec/EDMP/timesheet". A bare
+    # pattern is treated as github for backward compatibility, so existing
+    # policies keep working — but a new policy should qualify explicitly, or
+    # permitting a GitHub repo silently permits an identically named Azure one.
+    qualified = repo if ":" in repo else f"github:{repo}"
+    patterns = [p if ":" in p else f"github:{p}" for p in scope["allowed_repos"]]
+    if not matches_any(qualified, patterns):
+        return Decision(False, f"repo {qualified} is outside scope.allowed_repos")
 
     if pr.get("draft"):
         return Decision(False, "pull request is in draft state")
@@ -52,7 +69,7 @@ def check_scope(pr: dict, repo: str, labels: set[str], reviewed_shas: set[str],
             return Decision(False, f"label present: {label}")
 
     author = (pr.get("user") or {}).get("login", "")
-    if author.lower() in BOT_AUTHORS:
+    if author.lower() in _bot_authors():
         return Decision(False, f"author is a bot: {author}")
 
     if pr["head"]["sha"] in reviewed_shas:
@@ -129,7 +146,15 @@ def scan_for_secrets(files: list[ChangedFile]) -> Decision:
 
 
 REDACTORS = {
-    "email": (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "[redacted-email]"),
+    # The local part MUST start with an alphanumeric. Without that anchor the
+    # diff's own "+" marker is a valid local part, so "+@app.post(...)" reads as
+    # an email address and the decorator is redacted out of the code under
+    # review. That silently corrupted every Python file using @module.method
+    # decorators — Flask, FastAPI, pytest — and the model then reported the
+    # mangled syntax as a defect. Found by the agent reviewing this repository.
+    "email": (re.compile(
+        r"\b[A-Za-z0-9][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}\b"),
+        "[redacted-email]"),
     "ip": (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[redacted-ip]"),
     "api_key": (re.compile(r"(?i)\b(?:api[_-]?key|apikey|access[_-]?token)\b\s*[:=]\s*"
                            r"['\"]?[A-Za-z0-9\-._~+/]{12,}['\"]?"), "[redacted-api-key]"),

@@ -22,10 +22,20 @@ from __future__ import annotations
 import os
 from typing import Any, Callable
 
+# Set at import, before any client is constructed and before any
+# auto-instrumentation can fire. Client(hide_inputs=...) only masks traces sent
+# through that one client instance; anything else instrumenting the model SDK
+# uses its own client and ignores it. These variables are global and apply to
+# every trace the process emits, which is the only version of this control that
+# actually holds.
+os.environ.setdefault("LANGSMITH_HIDE_INPUTS", "true")
+os.environ.setdefault("LANGSMITH_HIDE_OUTPUTS", "true")
+
 _ENABLED = False
 _DISABLED_REASON = "not configured"
 _CLIENT: Any = None
 _METADATA: dict[str, Any] = {}
+_ROOT_RUN_ID: str | None = None
 
 # Env vars LangSmith reads. Cleared wholesale when tracing must not happen, so
 # that a stray import cannot re-enable it.
@@ -66,7 +76,18 @@ def configure(*, restricted: bool, project: str | None, run_id: str, repo: str,
         hide_outputs=True,
     )
     os.environ["LANGSMITH_TRACING"] = "true"
+    os.environ["LANGSMITH_HIDE_INPUTS"] = "true"
+    os.environ["LANGSMITH_HIDE_OUTPUTS"] = "true"
     os.environ.setdefault("LANGSMITH_PROJECT", "ispl-cra")
+
+    # Fail closed. If the masking variables are not set at this point, do not
+    # trace at all: a trace carrying the diff is worse than no trace.
+    if (os.environ.get("LANGSMITH_HIDE_INPUTS") != "true"
+            or os.environ.get("LANGSMITH_HIDE_OUTPUTS") != "true"):
+        _hard_disable()
+        _DISABLED_REASON = "input/output masking could not be enforced"
+        print(f"::warning::tracing disabled — {_DISABLED_REASON}")
+        return False
 
     _METADATA = {
         "run_id": run_id,
@@ -89,6 +110,10 @@ def _hard_disable() -> None:
     for var in _LS_VARS:
         os.environ.pop(var, None)
     os.environ["LANGSMITH_TRACING"] = "false"
+    # Left set deliberately. If anything re-enables tracing later in the
+    # process, it must still not be able to ship inputs or outputs.
+    os.environ["LANGSMITH_HIDE_INPUTS"] = "true"
+    os.environ["LANGSMITH_HIDE_OUTPUTS"] = "true"
 
 
 def enabled() -> bool:
@@ -108,13 +133,24 @@ def span(name: str, run_type: str = "chain") -> Callable:
     restricted run, so call sites need no conditionals."""
     def decorator(fn: Callable) -> Callable:
         def wrapper(*args, **kwargs):
+            global _ROOT_RUN_ID
             if not _ENABLED:
                 return fn(*args, **kwargs)
             from langsmith import traceable
+            from langsmith.run_helpers import get_current_run_tree
+
+            def inner(*a, **kw):
+                global _ROOT_RUN_ID
+                tree = get_current_run_tree()
+                if tree is not None and _ROOT_RUN_ID is None:
+                    _ROOT_RUN_ID = str(tree.id)
+                return fn(*a, **kw)
+
+            inner.__name__ = getattr(fn, "__name__", name)
             traced = traceable(
                 name=name, run_type=run_type, client=_CLIENT,
                 metadata=_METADATA,
-            )(fn)
+            )(inner)
             return traced(*args, **kwargs)
         wrapper.__name__ = getattr(fn, "__name__", name)
         wrapper.__doc__ = getattr(fn, "__doc__", None)
@@ -132,6 +168,14 @@ def wrap_model_client(client: Any) -> Any:
     try:
         from langsmith.wrappers import wrap_anthropic
         return wrap_anthropic(client)
+    except AttributeError as exc:
+        # langsmith 0.12.1 patches client.messages first, then reaches for
+        # client.completions, which the current Anthropic SDK does not expose.
+        # By the time it raises, .messages is already instrumented, so the
+        # client we hand back is traced. Removing this call removes tracing of
+        # the model call entirely — do not "clean it up".
+        print(f"::debug::partial anthropic wrap ({exc}); messages is instrumented")
+        return client
     except Exception as exc:  # noqa: BLE001
         print(f"::warning::could not wrap model client for tracing: {exc}")
         return client
@@ -149,6 +193,12 @@ def record_outcome(*, verdict: str, findings_count: int, rejected_count: int,
     """
     if not _ENABLED or _CLIENT is None:
         return
+    if _ROOT_RUN_ID is None:
+        # No traced span ran, so there is nothing to attach feedback to. Skip
+        # quietly: the outcome is already in audit/run.json, which is the record
+        # that the policy actually requires.
+        print("::debug::no traced span; outcome recorded in audit log only")
+        return
     run_id = _METADATA.get("run_id")
     try:
         for key, value in (
@@ -159,7 +209,7 @@ def record_outcome(*, verdict: str, findings_count: int, rejected_count: int,
             ("escalated", bool(escalations)),
         ):
             _CLIENT.create_feedback(
-                run_id=None, key=key,
+                run_id=_ROOT_RUN_ID, key=key,
                 score=value if isinstance(value, (int, float, bool)) else None,
                 value=value if isinstance(value, str) else None,
                 comment=f"ispl-cra run {run_id}",

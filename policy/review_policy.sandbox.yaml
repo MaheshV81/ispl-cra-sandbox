@@ -53,6 +53,17 @@ scope:
   max_changed_files: 40
   max_diff_lines: 2000
   min_diff_lines: 1
+  bot_authors:
+    - "dependabot"
+    - "dependabot[bot]"
+    - "renovate"
+    - "renovate[bot]"
+    - "github-actions"
+    - "github-actions[bot]"
+    # Azure DevOps service identities. Verify these against your own
+    # organisation before relying on them — the display names are configurable.
+    - "Project Collection Build Service"
+    - "Microsoft.VisualStudio.Services.TFS"
   excluded_paths:
     - "**/.env*"
     - "**/*.pem"
@@ -204,6 +215,87 @@ branch_protection:
     justification_required: true
     logged_to_audit: true
 
+# ---------------------------------------------------------------------------
+# PROPOSED AMENDMENT to ISPL-CRA-001. Not in v1.1.0.
+#
+# The agent enforces these as a CEILING, checked before the model call. That is
+# not the same as a quota: it runs inside the agent, so it can only stop the
+# agent. A misconfigured deployment, a second agent, or anything calling the API
+# directly is unaffected. The hard quota belongs at the gateway
+# (higress/ai-review-gateway.yaml, ai-token-ratelimit.yaml), where the caller
+# cannot reach it. Describe this to Governance as defence in depth, not as
+# spend control.
+# ---------------------------------------------------------------------------
+cost:
+  # Refuse the call if the estimated prompt exceeds this. Catches an oversized
+  # diff before it is paid for rather than after.
+  max_tokens_per_run: 60000
+
+  # Cumulative across every run on one pull request, read back from prior
+  # summary comments. Catches the push-forty-times case.
+  max_tokens_per_pull_request: 400000
+
+  # RATES ARE UNVERIFIED PLACEHOLDERS. Check them against Anthropic's published
+  # pricing before quoting any figure from this system in a budget conversation.
+  # A model with no entry here records tokens and reports cost as null, which is
+  # deliberate: an absent cost prompts a question, a wrong one gets quoted.
+  rates_usd_per_million_tokens:
+    "anthropic:claude-haiku-4-5-20251001":
+      input: 1.00
+      output: 5.00
+      cache_write: 1.25
+      cache_read: 0.10
+    "anthropic:claude-sonnet-4-6":
+      input: 3.00
+      output: 15.00
+      cache_write: 3.75
+      cache_read: 0.30
+    # On-prem. No per-token cost; the expense is the hardware.
+    "ollama:qwen2.5-coder:32b":
+      input: 0.0
+      output: 0.0
+
+# ---------------------------------------------------------------------------
+# PROPOSED AMENDMENT to ISPL-CRA-001. Not in v1.1.0.
+#
+# Implements read_file_at_ref and lookup_coding_standard, which
+# authority.permitted_tools already allows. Both default to false: turning them
+# on changes what the agent sees, and that should be a decision rather than an
+# inherited default.
+#
+# Cost: MEASURED, not estimated. On a 200-line diff across three 350-line
+# files, context expansion took the prompt from ~1,650 to ~10,550 tokens — a
+# 540% increase at the original defaults. Context dominates the prompt when
+# files are large relative to the change, which is the common case.
+#
+# The defaults below are the conservative starting point: whole files only
+# under 200 lines, and a hard 600-line ceiling across the whole run. Raise
+# them only after measuring what the extra tokens buy you in fewer rejected
+# findings. More context is not free and is not automatically better. It exists to
+# remove the false positives caused by the agent judging a diff without the
+# surrounding code. Measure the trade on your own repos before assuming it pays.
+# ---------------------------------------------------------------------------
+context:
+  read_file_at_ref: true
+  # Files at or under this many lines are sent whole. Padded hunks miss
+  # declarations far above the change, which is the main false-positive
+  # source this feature addresses.
+  whole_file_under_lines: 200
+  lines_around_hunk: 25
+  max_file_lines: 1500
+  max_total_lines: 600
+
+  # Reads .ai-review/CONVENTIONS.md (or .github/CONVENTIONS.md, or
+  # CONVENTIONS.md) from the repository under review.
+  #
+  # Governance: that file lives in the repo, so anyone who can merge can change
+  # agent behaviour without touching this policy. Mitigated by a size cap,
+  # prompt framing that only permits ADDING constraints, and a conventions_hash
+  # in the audit record. If those mitigations are not enough for your risk
+  # appetite, leave this false and put conventions in the policy instead.
+  lookup_coding_standard: false
+  max_standard_chars: 6000
+
 audit:
   log_fields:
     - "run_id"
@@ -217,6 +309,15 @@ audit:
     - "prompt_hash"
     - "input_tokens"
     - "output_tokens"
+    - "cache_creation_input_tokens"
+    - "cache_read_input_tokens"
+    - "total_tokens"
+    - "estimated_prompt_tokens"
+    - "tokens_spent_before_run"
+    - "tokens_spent_on_pr_total"
+    - "cost_usd"
+    - "context_lines_supplied"
+    - "conventions_hash"
     - "findings_count"
     - "verdict"
     - "guardrail_blocks"

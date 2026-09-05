@@ -24,9 +24,38 @@ from . import model as ml
 from . import policy
 from . import render
 from . import tracing
+from . import usage as usage_mod
+from . import context as ctx
 from .diff import build_index
 
 STATE_RE = re.compile(r"<!-- ispl-cra-state: (.*?) -->", re.DOTALL)
+
+
+def _tokens_spent_on_pr(repo: str, pr_number: int, marker: str) -> int:
+    """Tokens already spent reviewing this pull request.
+
+    Read back from the state block in prior summary comments. The workflow
+    runner is ephemeral, so this is the only place a running total can live
+    without standing up a database. It is also why the ceiling is per-pull-
+    request rather than per-day: a PR comment can carry PR-scoped state and
+    nothing else.
+    """
+    total = 0
+    try:
+        for c in gh._paginate(f"{gh.API}/repos/{repo}/issues/{pr_number}/comments"):
+            body = c.get("body") or ""
+            if marker not in body:
+                continue
+            m = STATE_RE.search(body)
+            if not m:
+                continue
+            try:
+                total += int(json.loads(m.group(1)).get("tokens_this_run", 0))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+    except Exception:  # noqa: BLE001 - never fail a review over accounting
+        return 0
+    return total
 
 
 def _load_event() -> dict:
@@ -104,7 +133,25 @@ def analyze() -> int:
         _write_outcome({"action": "skip", "reason": reason, "escalate": escalate,
                         "head_sha": head_sha, "pr_number": pr_number, "repo": repo,
                         "run_id": run_id})
-        print(f"::notice::{reason}")
+
+        # An abstain is not a clean review, and the two must not look alike in
+        # the Actions UI. Phase 1 forbids failing the check, so the signal goes
+        # into an error annotation and a neutral check run with an honest title.
+        if verdict == "abstained" or escalate:
+            print(f"::error title=AI Review abstained::{reason}")
+            try:
+                check = policy.get("output.check_run")
+                gh.post_check_run(
+                    repo, head_sha, check["name"], "neutral",
+                    title=f"abstained — {verdict}",
+                    summary=f"The agent did not review this pull request.\n\n"
+                            f"Reason: {reason}\n\n"
+                            f"This is not an approval. No findings were produced.",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"::warning::could not post abstain check run: {exc}")
+        else:
+            print(f"::notice::{reason}")
         return 0
 
     # ---- stage 1a: scope admission ---------------------------------------
@@ -160,18 +207,58 @@ def analyze() -> int:
     if not tracing.enabled():
         print(f"::notice::tracing off — {tracing.disabled_reason()}")
 
-    user_msg = ml.build_user_message(pr, files, sensitive_hits, gr.redact)
+    # read_file_at_ref and lookup_coding_standard. Both policy-gated and both
+    # default off, so this is a no-op unless someone turned them on.
+    def _fetch(path: str) -> str | None:
+        return gh.fetch_file(repo, path, head_sha)
+
+    contexts = ctx.build(files, _fetch)
+    context_block = ctx.render(contexts)
+    audit["context_lines_supplied"] = sum(len(c.lines) for c in contexts.values())
+
+    standard = ctx.load_standard(_fetch)
+    standard_block = ctx.render_standard(standard[0]) if standard else ""
+    audit["conventions_hash"] = standard[1] if standard else None
+
+    if context_block:
+        print(f"context: {audit['context_lines_supplied']} lines across "
+              f"{len(contexts)} file(s)")
+    if standard:
+        print(f"coding standard loaded (hash {standard[1]})")
+
+    user_msg = ml.build_user_message(pr, files, sensitive_hits, gr.redact,
+                                     context_block, standard_block)
     audit["prompt_hash"] = render.prompt_hash(ml.SYSTEM_PROMPT, user_msg)
 
+    # Budget ceiling, checked BEFORE the call. Spend that has already happened
+    # cannot be refused, so a post-hoc check is a report, not a control.
+    spent_before = _tokens_spent_on_pr(repo, pr_number, marker)
+    budget = usage_mod.check_before_call(user_msg, spent_before)
+    audit["tokens_spent_before_run"] = spent_before
+    audit["estimated_prompt_tokens"] = budget.estimated_tokens
+    if not budget.allowed:
+        return stop(f"budget ceiling: {budget.reason}", escalate=True,
+                    verdict="budget_exceeded")
+
     try:
-        payload, tool_calls, usage = ml.invoke(model_id, restricted, user_msg)
+        invoke_traced = tracing.span("review_diff", "llm")(ml.invoke)
+        payload, tool_calls, usage = invoke_traced(model_id, restricted, user_msg)
     except Exception as exc:  # noqa: BLE001
         # No fallback. A restricted backend outage abstains to a human.
         return stop(f"model call failed on {model_id}: {exc}", escalate=True,
                     verdict="abstained")
 
-    audit["input_tokens"] = usage.get("input_tokens", 0)
-    audit["output_tokens"] = usage.get("output_tokens", 0)
+    # Every token field the provider returned, not just the two headline ones.
+    for key, value in usage.items():
+        audit[key] = value
+    run_usage = usage_mod.Usage(
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_creation_input_tokens=usage.get("cache_creation_input_tokens", 0),
+        cache_read_input_tokens=usage.get("cache_read_input_tokens", 0),
+    )
+    audit["cost_usd"] = usage_mod.cost_usd(run_usage, model_id)
+    audit["tokens_spent_on_pr_total"] = spent_before + run_usage.total
 
     # ---- stage 3: block write actions ------------------------------------
     writes = gr.assert_no_write_action(tool_calls)
@@ -215,9 +302,17 @@ def analyze() -> int:
         not_reviewed=not_reviewed, model_used=model_id, run_id=run_id,
         head_sha=head_sha, escalations=escalations,
     )
-    state = {"findings": [{k: f[k] for k in ("path", "line", "severity", "category", "title")}
-                          for f in combined if f["severity"] in ("blocker", "major")]}
+    state = {
+        "findings": [{k: f[k] for k in ("path", "line", "severity", "category", "title")}
+                     for f in combined if f["severity"] in ("blocker", "major")],
+        "tokens_this_run": run_usage.total,
+        "cost_usd": audit["cost_usd"],
+    }
     summary += f"\n<!-- ispl-cra-state: {json.dumps(state)} -->"
+
+    summary += ("\n\n<sub>"
+                + usage_mod.format_ledger_line(run_usage, model_id, spent_before)
+                + "</sub>")
 
     inline = render.select_inline(combined, index)
 
